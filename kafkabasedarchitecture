@@ -1,0 +1,211 @@
+ai.py
+import argparse
+import json
+import os
+import time
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from kafka import KafkaProducer
+
+
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "vehicle.events")
+KAFKA_RETRY_SECONDS = float(os.getenv("KAFKA_RETRY_SECONDS", "3"))
+
+
+def send_vehicle_event(vehicle_number: str, lane_id: str = "1") -> None:
+    event = {
+        "vehicle_number": vehicle_number.strip(),
+        "lane_id": lane_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "event_id": str(uuid4()),
+    }
+
+    data = json.dumps(event).encode("utf-8")
+    while True:
+        try:
+            producer = KafkaProducer(
+                bootstrap_servers=KAFKA_BOOTSTRAP.split(","),
+                acks="all",
+                retries=3,
+                linger_ms=0,
+            )
+            result = producer.send("vehicle.events", data).get(timeout=10)
+            producer.flush()
+            producer.close()
+            break
+        except Exception as error:
+            print(f"kafka not ready at {KAFKA_BOOTSTRAP}: {error}")
+            print(f"retrying in {KAFKA_RETRY_SECONDS} seconds...")
+            time.sleep(KAFKA_RETRY_SECONDS)
+
+    print(
+        f"sent {event['vehicle_number']} "
+        f"topic={result.topic} partition={result.partition} offset={result.offset}"
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Produce vehicle event to Kafka.")
+    parser.add_argument("vehicle_number", nargs="?", help="Example: RJ14AB1234")
+    parser.add_argument("--lane-id", default="1")
+    args = parser.parse_args()
+
+    vehicle_number = args.vehicle_number or input("Vehicle number: ").strip()
+    if not vehicle_number:
+        raise SystemExit("vehicle number required")
+
+    send_vehicle_event(vehicle_number, args.lane_id)
+
+
+if __name__ == "__main__":
+    main()
+
+
+2) display.py
+import json
+import time
+
+import serial
+from kafka import KafkaConsumer
+
+
+def clear_command() -> str:
+    return "|C|1|6|"
+
+
+def message_command(text: str) -> str:
+    safe_text = "".join(ch for ch in text.strip() if 32 <= ord(ch) <= 126)
+    return f"|C|1|4|1|0-0-#{safe_text}|"
+
+
+def vehicle_number_from_message(data: bytes) -> str:
+    text = data.decode("utf-8", errors="replace").strip()
+    try:
+        event = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+    if isinstance(event, dict):
+        return str(event.get("vehicle_number") or event.get("vehicleNumber") or "").strip()
+    return str(event).strip()
+
+
+def write_command(port: serial.Serial, command: str) -> None:
+    port.write(command.encode("ascii", errors="replace"))
+    port.flush()
+    print(f"display sent {command}", flush=True)
+    time.sleep(0.02)
+
+
+def show_vehicle(port: serial.Serial, vehicle_number: str) -> None:
+    write_command(port, clear_command())
+    write_command(port, message_command(vehicle_number))
+    write_command(port, clear_command())
+    write_command(port, message_command("WELCOME"))
+
+
+def kafka_consumer() -> KafkaConsumer:
+    while True:
+        try:
+            return KafkaConsumer(
+                "vehicle.events",
+                bootstrap_servers=["localhost:9092"],
+                group_id="display-service",
+                auto_offset_reset="latest",
+                enable_auto_commit=True,
+            )
+        except Exception as error:
+            print(f"kafka not ready at localhost:9092: {error}", flush=True)
+            print("retrying in 3 seconds...", flush=True)
+            time.sleep(3)
+
+
+def main() -> None:
+    print("display listening topic=vehicle.events kafka=localhost:9092", flush=True)
+    print("display serial=COM3 baudrate=9600", flush=True)
+
+    consumer = kafka_consumer()
+    with serial.Serial("COM3", 9600, timeout=1, write_timeout=1) as port:
+        for message in consumer:
+            vehicle_number = vehicle_number_from_message(message.value)
+            if not vehicle_number:
+                print("empty vehicle number skipped", flush=True)
+                continue
+            print(f"display message received: {vehicle_number}", flush=True)
+            show_vehicle(port, vehicle_number)
+
+
+if __name__ == "__main__":
+    main()
+
+3) barrier.py
+import json
+import socket
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+from kafka import KafkaConsumer
+
+
+def vehicle_number_from_message(data: bytes) -> str:
+    text = data.decode("utf-8", errors="replace").strip()
+    try:
+        event = json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+    if isinstance(event, dict):
+        return str(event.get("vehicle_number") or event.get("vehicleNumber") or "").strip()
+    return str(event).strip()
+
+
+def open_barrier(vehicle_number: str) -> None:
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.settimeout(1)
+
+    try:
+        client.connect(("127.0.0.1", 5000))
+        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        client.sendall("|OPENEN%".encode("ascii"))
+        print(f"barrier opened for {vehicle_number}", flush=True)
+    except OSError as error:
+        print(f"barrier failed for {vehicle_number}: {error}", flush=True)
+    finally:
+        client.close()
+
+
+def kafka_consumer() -> KafkaConsumer:
+    while True:
+        try:
+            return KafkaConsumer(
+                "vehicle.events",
+                bootstrap_servers=["localhost:9092"],
+                group_id="barrier-service",
+                auto_offset_reset="latest",
+                enable_auto_commit=True,
+            )
+        except Exception as error:
+            print(f"kafka not ready at localhost:9092: {error}", flush=True)
+            print("retrying in 3 seconds...", flush=True)
+            time.sleep(3)
+
+
+def main() -> None:
+    print("barrier listening topic=vehicle.events kafka=localhost:9092", flush=True)
+    print("barrier socket=127.0.0.1:5000 command=|OPENEN%", flush=True)
+
+    consumer = kafka_consumer()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for message in consumer:
+            vehicle_number = vehicle_number_from_message(message.value)
+            if not vehicle_number:
+                print("empty vehicle number skipped", flush=True)
+                continue
+            print(f"barrier message received: {vehicle_number}", flush=True)
+            pool.submit(open_barrier, vehicle_number)
+
+
+if __name__ == "__main__":
+    main()
