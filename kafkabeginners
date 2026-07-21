@@ -1,0 +1,32 @@
+1) AI.py
+import json
+from datetime import datetime
+from kafka import KafkaProducer
+
+def main():
+    producer = KafkaProducer(bootstrap_servers=["localhost:9092"])
+    while True:
+        vehicle = input("Vehicle Number: ")
+        event = {"vehicle_number": vehicle,"lane_id": "1","created_at": datetime.now().isoformat()}
+        # Manually convert to JSON bytes
+        data = json.dumps(event).encode("utf-8")
+        result = producer.send("vehicle.events", data).get(timeout=10)
+        print(f"Topic: {result.topic}")
+        print(f"Partition: {result.partition}")
+        print(f"Offset: {result.offset}")
+
+if __name__ == "__main__":
+    main()
+
+2) barrier.py 
+
+from kafka import KafkaConsumer
+def main() -> None:
+    print("barrier listening topic=vehicle.events kafka=localhost:9092", flush=True)
+    consumer = KafkaConsumer("vehicle.events",bootstrap_servers=["localhost:9092"],group_id="barrier-service",auto_offset_reset="latest",enable_auto_commit=True,)
+    for message in consumer:
+        print(f"barrier message received: {message.value.decode('utf-8')}", flush=True)
+
+if __name__ == "__main__":
+    main()
+
